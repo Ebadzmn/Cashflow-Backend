@@ -1,0 +1,13 @@
+node_modules
+.env
+
+.env
+.env.*
+.npm-install-cache/
+.production-install-check/
+node_modules/
+dist/
+coverage/
+uploads/
+winston/
+*.log
