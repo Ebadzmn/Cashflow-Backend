@@ -37,10 +37,30 @@ const notificationHistory = z.object({
   }),
 });
 
+const verifyGooglePurchase = z.object({
+  body: z.object({
+    purchaseToken: z.string().min(1),
+    productId: z.string().min(1),
+  }),
+});
+
+const googleWebhook = z.object({
+  body: z.object({
+    message: z.object({
+      data: z.string().min(1),
+      messageId: z.string().optional(),
+      publishTime: z.string().optional(),
+    }),
+    subscription: z.string().optional(),
+  }),
+});
+
 export const SubscriptionValidation = {
   verifyPurchase,
+  verifyGooglePurchase,
   restorePurchase,
   webhook,
+  googleWebhook,
   notificationTest,
   notificationHistory,
 };

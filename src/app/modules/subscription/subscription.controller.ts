@@ -103,12 +103,39 @@ const notificationDetails = catchAsync(async (req: Request, res: Response) => {
   });
 });
 
+const verifyGooglePurchase = catchAsync(async (req: Request, res: Response) => {
+  const result = await SubscriptionService.verifyGooglePurchase(
+    (req.user as JwtPayload).id,
+    req.body,
+  );
+  sendResponse(res, {
+    statusCode: StatusCodes.OK,
+    success: true,
+    message: 'Google Play subscription verified successfully',
+    data: result,
+  });
+});
+
+const googleWebhook = catchAsync(async (req: Request, res: Response) => {
+  const result = await SubscriptionService.processGoogleWebhook(
+    req.body.message.data,
+  );
+  sendResponse(res, {
+    statusCode: StatusCodes.OK,
+    success: true,
+    message: 'Google Play notification processed',
+    data: result,
+  });
+});
+
 export const SubscriptionController = {
   verifyPurchase,
+  verifyGooglePurchase,
   getStatus,
   restorePurchase,
   getHistory,
   webhook,
+  googleWebhook,
   notificationTest,
   notificationHistory,
   notificationDetails,

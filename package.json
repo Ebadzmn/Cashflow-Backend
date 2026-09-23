@@ -66,6 +66,7 @@
     "exceljs": "^4.4.0",
     "express": "^4.19.2",
     "express-rate-limit": "^8.6.2",
+    "googleapis": "^181.0.0",
     "heic-convert": "^2.1.0",
     "helmet": "^8.3.0",
     "http-status": "^2.1.0",

@@ -184,6 +184,51 @@ if (appleSubscriptionsEnabled) {
   }
 }
 
+const googleSubscriptionsEnabled = parseBoolean(
+  'GOOGLE_SUBSCRIPTIONS_ENABLED',
+  false,
+);
+const googleValue = (name: string) =>
+  googleSubscriptionsEnabled ? requiredEnv(name) : optionalEnv(name);
+const googleServiceAccountKey = optionalEnv('GOOGLE_SERVICE_ACCOUNT_KEY');
+const googleServiceAccountKeyPath = optionalEnv(
+  'GOOGLE_SERVICE_ACCOUNT_KEY_PATH',
+);
+if (
+  googleSubscriptionsEnabled &&
+  !googleServiceAccountKey &&
+  !googleServiceAccountKeyPath
+) {
+  throw new Error(
+    'GOOGLE_SERVICE_ACCOUNT_KEY or GOOGLE_SERVICE_ACCOUNT_KEY_PATH is required when Google subscriptions are enabled',
+  );
+}
+if (
+  googleSubscriptionsEnabled &&
+  googleServiceAccountKeyPath &&
+  !fs.existsSync(path.resolve(googleServiceAccountKeyPath))
+) {
+  throw new Error(
+    `GOOGLE_SERVICE_ACCOUNT_KEY_PATH does not exist: ${googleServiceAccountKeyPath}`,
+  );
+}
+const googleProductMap = googleValue('GOOGLE_PRODUCT_MAP');
+if (googleSubscriptionsEnabled) {
+  let parsedGoogleProductMap: unknown;
+  try {
+    parsedGoogleProductMap = JSON.parse(googleProductMap);
+  } catch {
+    throw new Error('GOOGLE_PRODUCT_MAP must be valid JSON');
+  }
+  if (
+    !parsedGoogleProductMap ||
+    typeof parsedGoogleProductMap !== 'object' ||
+    !Object.keys(parsedGoogleProductMap).length
+  ) {
+    throw new Error('GOOGLE_PRODUCT_MAP must contain at least one product');
+  }
+}
+
 const emailPort = parsePositiveInteger('EMAIL_PORT', undefined, 65_535);
 const emailFrom = requiredEnv('EMAIL_FROM');
 const superAdminPassword = requiredEnv('SUPER_ADMIN_PASSWORD');
@@ -322,6 +367,13 @@ const config = {
     statusCacheMs: String(
       parsePositiveInteger('APPLE_STATUS_CACHE_MS', 60_000, 5 * 60_000),
     ),
+  },
+  google: {
+    enabled: googleSubscriptionsEnabled,
+    packageName: googleValue('GOOGLE_PACKAGE_NAME'),
+    serviceAccountKey: googleServiceAccountKey,
+    serviceAccountKeyPath: googleServiceAccountKeyPath,
+    productMap: googleProductMap,
   },
 };
 

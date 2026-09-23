@@ -14,6 +14,7 @@ import { BankTransactionRoutes } from '../app/modules/bankTransaction/bankTransa
 import { ReportRoutes } from '../app/modules/report/report.route';
 import {
   AppleWebhookRoutes,
+  GoogleWebhookRoutes,
   SubscriptionRoutes,
 } from '../app/modules/subscription/subscription.route';
 import { OCRRoutes } from '../app/modules/ocr/ocr.route';
@@ -89,6 +90,10 @@ const apiRoutes = [
   {
     path: '/apple',
     route: AppleWebhookRoutes,
+  },
+  {
+    path: '/google',
+    route: GoogleWebhookRoutes,
   },
   {
     path: '/ocr',

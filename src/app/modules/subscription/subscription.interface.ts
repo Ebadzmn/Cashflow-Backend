@@ -33,6 +33,8 @@ export type ISubscription = {
   user: Types.ObjectId;
   plan: SUBSCRIPTION_PLAN;
   billingCycle: BILLING_CYCLE;
+  platform?: PLATFORM;
+  purchaseToken?: string;
   transactionId: string;
   originalTransactionId: string;
   productId: string;

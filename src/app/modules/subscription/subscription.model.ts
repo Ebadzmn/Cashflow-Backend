@@ -2,6 +2,7 @@ import { Schema, model } from 'mongoose';
 import {
   BILLING_CYCLE,
   ISubscription,
+  PLATFORM,
   SUBSCRIPTION_PLAN,
   SUBSCRIPTION_STATUS,
 } from './subscription.interface';
@@ -12,6 +13,17 @@ const subscriptionSchema = new Schema<ISubscription>(
       type: Schema.Types.ObjectId,
       ref: 'User',
       required: true,
+      index: true,
+    },
+    platform: {
+      type: String,
+      enum: Object.values(PLATFORM),
+      default: PLATFORM.IOS,
+      index: true,
+    },
+    purchaseToken: {
+      type: String,
+      sparse: true,
       index: true,
     },
     plan: {

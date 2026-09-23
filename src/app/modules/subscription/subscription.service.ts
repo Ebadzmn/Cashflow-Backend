@@ -16,16 +16,22 @@ import { Types } from 'mongoose';
 import config from '../../../config';
 import QueryBuilder from '../../../builder/QueryBuilder';
 import ApiError from '../../../errors/ApiError';
+import { errorContext, errorLogger } from '../../../shared/logger';
 import { User } from '../user/user.model';
 import {
   getAppleClient,
   getAppleVerifier,
   getTransactionFromApple,
 } from './appleClient';
+import {
+  acknowledgeGoogleSubscription,
+  getGoogleSubscriptionV2,
+} from './googleClient';
 import { AppleNotification } from './appleNotification.model';
 import {
   BILLING_CYCLE,
   ISubscription,
+  PLATFORM,
   SUBSCRIPTION_PLAN,
   SUBSCRIPTION_STATUS,
 } from './subscription.interface';
@@ -49,6 +55,20 @@ const productMappings = (): Record<string, ProductMapping> => {
     throw new ApiError(
       StatusCodes.SERVICE_UNAVAILABLE,
       'APPLE_PRODUCT_MAP must be valid JSON',
+    );
+  }
+};
+
+const googleProductMappings = (): Record<string, ProductMapping> => {
+  try {
+    return JSON.parse(config.google.productMap || '{}') as Record<
+      string,
+      ProductMapping
+    >;
+  } catch {
+    throw new ApiError(
+      StatusCodes.SERVICE_UNAVAILABLE,
+      'GOOGLE_PRODUCT_MAP must be valid JSON',
     );
   }
 };
@@ -317,7 +337,7 @@ async function getStatus(userId: string, forceRefresh = false) {
   const stored = await Subscription.findOne({ user: userId })
     .sort({ expiryDate: -1 })
     .select(
-      'originalTransactionId environment expiryDate status lastVerifiedAt',
+      'platform originalTransactionId environment expiryDate status lastVerifiedAt purchaseToken productId',
     );
   if (!stored) return { premium: false, expiresAt: null };
 
@@ -331,6 +351,50 @@ async function getStatus(userId: string, forceRefresh = false) {
     stored.lastVerifiedAt &&
     stored.lastVerifiedAt.getTime() > Date.now() - statusCacheMs
   ) {
+    return {
+      premium:
+        [SUBSCRIPTION_STATUS.ACTIVE, SUBSCRIPTION_STATUS.GRACE_PERIOD].includes(
+          stored.status,
+        ) && stored.expiryDate > new Date(),
+      expiresAt: stored.expiryDate,
+    };
+  }
+
+  // If this subscription is from Google Play (Android)
+  if (stored.platform === PLATFORM.ANDROID) {
+    if (config.google.enabled && stored.purchaseToken) {
+      try {
+        const subData = await getGoogleSubscriptionV2(stored.purchaseToken);
+        const lineItem = subData.lineItems?.[0];
+        const expiryTime = lineItem?.expiryTime
+          ? new Date(lineItem.expiryTime)
+          : stored.expiryDate;
+        const subState = subData.subscriptionState;
+
+        let computedStatus = stored.status;
+        if (subState === 'SUBSCRIPTION_STATE_ACTIVE') {
+          computedStatus = SUBSCRIPTION_STATUS.ACTIVE;
+        } else if (subState === 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD') {
+          computedStatus = SUBSCRIPTION_STATUS.GRACE_PERIOD;
+        } else if (subState === 'SUBSCRIPTION_STATE_CANCELED') {
+          computedStatus = SUBSCRIPTION_STATUS.CANCELLED;
+        } else if (subState === 'SUBSCRIPTION_STATE_EXPIRED') {
+          computedStatus = SUBSCRIPTION_STATUS.EXPIRED;
+        }
+
+        stored.status = computedStatus;
+        stored.expiryDate = expiryTime;
+        stored.lastVerifiedAt = new Date();
+        await stored.save();
+        await synchronizeUserEntitlement(userId);
+      } catch (err) {
+        errorLogger.error(
+          'Failed to refresh Google subscription status',
+          errorContext(err),
+        );
+      }
+    }
+
     return {
       premium:
         [SUBSCRIPTION_STATUS.ACTIVE, SUBSCRIPTION_STATUS.GRACE_PERIOD].includes(
@@ -667,12 +731,200 @@ const getSubscriptionHistoryFromDB = async (
   };
 };
 
+const verifyGooglePurchase = async (
+  userId: string | Types.ObjectId,
+  payload: { purchaseToken: string; productId: string },
+) => {
+  if (!config.google.enabled) {
+    throw new ApiError(
+      StatusCodes.SERVICE_UNAVAILABLE,
+      'Google subscriptions are not enabled',
+    );
+  }
+
+  const mapping = googleProductMappings()[payload.productId];
+  if (!mapping) {
+    throw new ApiError(StatusCodes.BAD_REQUEST, 'Unsupported Google product');
+  }
+
+  const subData = await getGoogleSubscriptionV2(payload.purchaseToken);
+  const lineItem =
+    subData.lineItems?.find(item => item.productId === payload.productId) ||
+    subData.lineItems?.[0];
+
+  if (!lineItem) {
+    throw new ApiError(
+      StatusCodes.BAD_REQUEST,
+      'Google subscription has no matching line items',
+    );
+  }
+
+  const expiryTime = lineItem.expiryTime
+    ? new Date(lineItem.expiryTime)
+    : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+  const startTime = subData.startTime
+    ? new Date(subData.startTime)
+    : new Date();
+
+  // Acknowledge subscription if pending
+  if (subData.acknowledgementState === 'ACKNOWLEDGEMENT_STATE_PENDING') {
+    await acknowledgeGoogleSubscription(
+      payload.productId,
+      payload.purchaseToken,
+    );
+  }
+
+  // Derive status
+  let status = SUBSCRIPTION_STATUS.ACTIVE;
+  const subState = subData.subscriptionState;
+  if (subState === 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD') {
+    status = SUBSCRIPTION_STATUS.GRACE_PERIOD;
+  } else if (subState === 'SUBSCRIPTION_STATE_ON_HOLD') {
+    status = SUBSCRIPTION_STATUS.BILLING_RETRY;
+  } else if (subState === 'SUBSCRIPTION_STATE_CANCELED') {
+    status = SUBSCRIPTION_STATUS.CANCELLED;
+  } else if (
+    subState === 'SUBSCRIPTION_STATE_EXPIRED' ||
+    expiryTime <= new Date()
+  ) {
+    status = SUBSCRIPTION_STATUS.EXPIRED;
+  }
+
+  const orderId =
+    (subData as any).latestOrderId ||
+    (subData.lineItems?.[0] as any)?.latestOrderId ||
+    `GPA.${randomUUID()}`;
+
+  // Check ownership
+  const existingOwner = await Subscription.findOne({
+    purchaseToken: payload.purchaseToken,
+  }).select('user');
+  if (existingOwner && existingOwner.user.toString() !== userId.toString()) {
+    throw new ApiError(
+      StatusCodes.CONFLICT,
+      'This Google subscription belongs to another account',
+    );
+  }
+
+  // Persist or update
+  const environment =
+    config.node_env.toLowerCase() === 'production' ? 'Production' : 'Sandbox';
+
+  const subscription = await Subscription.findOneAndUpdate(
+    {
+      $or: [
+        { purchaseToken: payload.purchaseToken },
+        { transactionId: orderId },
+      ],
+    },
+    {
+      $set: {
+        user: userId,
+        platform: PLATFORM.ANDROID,
+        plan: mapping.plan,
+        billingCycle: mapping.billingCycle,
+        productId: payload.productId,
+        purchaseToken: payload.purchaseToken,
+        transactionId: orderId,
+        originalTransactionId: orderId,
+        environment,
+        startDate: startTime,
+        expiryDate: expiryTime,
+        status,
+        lastVerifiedAt: new Date(),
+      },
+    },
+    { upsert: true, new: true, runValidators: true },
+  );
+
+  await synchronizeUserEntitlement(userId);
+
+  const premium =
+    [SUBSCRIPTION_STATUS.ACTIVE, SUBSCRIPTION_STATUS.GRACE_PERIOD].includes(
+      subscription.status,
+    ) && subscription.expiryDate > new Date();
+
+  return {
+    premium,
+    expiresAt: subscription.expiryDate,
+    plan: subscription.plan,
+  };
+};
+
+const processGoogleWebhook = async (messageData: string) => {
+  let notificationJson: any;
+  try {
+    const decoded = Buffer.from(messageData, 'base64').toString('utf8');
+    notificationJson = JSON.parse(decoded);
+  } catch {
+    throw new ApiError(
+      StatusCodes.BAD_REQUEST,
+      'Invalid Pub/Sub base64 payload',
+    );
+  }
+
+  const subNotification = notificationJson?.subscriptionNotification;
+  if (!subNotification) {
+    return { ignored: true };
+  }
+
+  const { purchaseToken, subscriptionId, notificationType } = subNotification;
+  if (!purchaseToken) return { ignored: true };
+
+  const stored = await Subscription.findOne({ purchaseToken });
+  if (!stored) {
+    return { ignored: true };
+  }
+
+  // Re-fetch latest status from Google
+  try {
+    const subData = await getGoogleSubscriptionV2(purchaseToken);
+    const lineItem = subData.lineItems?.[0];
+    const expiryTime = lineItem?.expiryTime
+      ? new Date(lineItem.expiryTime)
+      : stored.expiryDate;
+
+    let status = stored.status;
+    const subState = subData.subscriptionState;
+    if (subState === 'SUBSCRIPTION_STATE_ACTIVE') {
+      status = SUBSCRIPTION_STATUS.ACTIVE;
+    } else if (subState === 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD') {
+      status = SUBSCRIPTION_STATUS.GRACE_PERIOD;
+    } else if (subState === 'SUBSCRIPTION_STATE_ON_HOLD') {
+      status = SUBSCRIPTION_STATUS.BILLING_RETRY;
+    } else if (subState === 'SUBSCRIPTION_STATE_CANCELED') {
+      status = SUBSCRIPTION_STATUS.CANCELLED;
+    } else if (
+      subState === 'SUBSCRIPTION_STATE_EXPIRED' ||
+      expiryTime <= new Date()
+    ) {
+      status = SUBSCRIPTION_STATUS.EXPIRED;
+    }
+
+    stored.status = status;
+    stored.expiryDate = expiryTime;
+    stored.lastVerifiedAt = new Date();
+    await stored.save();
+
+    await synchronizeUserEntitlement(stored.user);
+  } catch (error) {
+    errorLogger.error(
+      'Error updating Google subscription from webhook',
+      errorContext(error),
+    );
+  }
+
+  return { processed: true, notificationType, subscriptionId };
+};
+
 export const SubscriptionService = {
   verifyPurchase,
+  verifyGooglePurchase,
   getStatus,
   restorePurchase,
   getAppleHistory,
   processWebhook,
+  processGoogleWebhook,
   requestNotificationTest,
   getNotificationHistory,
   getNotificationDetails,
